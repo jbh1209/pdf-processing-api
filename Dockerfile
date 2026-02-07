@@ -8,11 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pdfcpu
-RUN wget -q https://github.com/pdfcpu/pdfcpu/releases/download/v0.6.0/pdfcpu_0.6.0_Linux_x86_64.tar.xz \
-    && tar -xf pdfcpu_0.6.0_Linux_x86_64.tar.xz \
-    && mv pdfcpu /usr/local/bin/ \
-    && rm pdfcpu_0.6.0_Linux_x86_64.tar.xz
+# Install pdfcpu (robust)
+RUN wget -q https://github.com/pdfcpu/pdfcpu/releases/download/v0.6.0/pdfcpu_0.6.0_Linux_x86_64.tar.xz -O /tmp/pdfcpu.tar.xz \
+    && mkdir -p /tmp/pdfcpu \
+    && tar -xJf /tmp/pdfcpu.tar.xz -C /tmp/pdfcpu \
+    && install -m 0755 "$(find /tmp/pdfcpu -type f -name pdfcpu | head -n 1)" /usr/local/bin/pdfcpu \
+    && rm -rf /tmp/pdfcpu /tmp/pdfcpu.tar.xz \
+    && pdfcpu version
+
 
 WORKDIR /app
 COPY requirements.txt .
