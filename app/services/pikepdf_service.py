@@ -91,6 +91,62 @@ class PikepdfService:
             boxes["art_box"] = list(page.ArtBox)
         
         return boxes
+
+        async def get_page_boxes_detailed(self, input_path: Path) -> dict:
+        """
+        Extract detailed page box information with dimensions.
+        
+        Returns all page boxes from the first page with x1, y1, x2, y2, width, height.
+        All values are in PDF points (1 pt = 1/72 inch = 0.3528 mm).
+        """
+        try:
+            with pikepdf.open(input_path) as pdf:
+                if len(pdf.pages) == 0:
+                    raise PDFProcessingError("PDF has no pages")
+                
+                page = pdf.pages[0]
+                
+                def box_to_dict(box_array) -> dict | None:
+                    """Convert pikepdf box array [x1, y1, x2, y2] to dict with dimensions."""
+                    if box_array is None:
+                        return None
+                    try:
+                        # Convert pikepdf objects to floats
+                        coords = [float(x) for x in box_array]
+                        if len(coords) != 4:
+                            return None
+                        x1, y1, x2, y2 = coords
+                        return {
+                            "x1": round(x1, 2),
+                            "y1": round(y1, 2),
+                            "x2": round(x2, 2),
+                            "y2": round(y2, 2),
+                            "width": round(abs(x2 - x1), 2),
+                            "height": round(abs(y2 - y1), 2)
+                        }
+                    except (IndexError, TypeError, ValueError) as e:
+                        logger.warning(f"Failed to parse box: {e}")
+                        return None
+                
+                # Extract all boxes - MediaBox is always present
+                result = {
+                    "mediabox": box_to_dict(page.MediaBox if "/MediaBox" in page else None),
+                    "cropbox": box_to_dict(page.CropBox if "/CropBox" in page else None),
+                    "bleedbox": box_to_dict(page.BleedBox if "/BleedBox" in page else None),
+                    "trimbox": box_to_dict(page.TrimBox if "/TrimBox" in page else None),
+                    "artbox": box_to_dict(page.ArtBox if "/ArtBox" in page else None),
+                }
+                
+                logger.info(f"Extracted page boxes: mediabox={result['mediabox']}, trimbox={result['trimbox']}")
+                return result
+                
+        except pikepdf.PdfError as e:
+            logger.error(f"PDF parsing error: {e}")
+            raise PDFProcessingError(f"Failed to parse PDF: {str(e)}")
+        except Exception as e:
+            logger.error(f"Page boxes extraction error: {e}")
+            raise PDFProcessingError(f"Failed to extract page boxes: {str(e)}")
+
     
     def _get_fonts(self, pdf) -> list:
         """Extract font information."""
