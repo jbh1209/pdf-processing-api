@@ -10,6 +10,7 @@ import logging
 
 from app.services.pikepdf_service import PikepdfService
 from app.services.file_manager import FileManager
+import pikepdf
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class PageBoxesResponse(BaseModel):
     bleedbox: Optional[BoxDimensions] = None
     trimbox: Optional[BoxDimensions] = None
     artbox: Optional[BoxDimensions] = None
+    page_count: int = 1
 
 
 @router.post("", response_model=PageBoxesResponse)
@@ -56,14 +58,17 @@ async def get_page_boxes(request: PageBoxesRequest):
     input_path = None
     
     try:
-        # Download PDF from URL
         logger.info(f"Downloading PDF from: {request.pdf_url[:80]}...")
         input_path = await file_manager.download_from_url(request.pdf_url)
         
         # Extract page boxes
         boxes = await pikepdf_service.get_page_boxes_detailed(input_path)
         
-        return PageBoxesResponse(**boxes)
+        # Get page count
+        pdf = pikepdf.Pdf.open(input_path)
+        page_count = len(pdf.pages)
+        
+        return PageBoxesResponse(**boxes, page_count=page_count)
         
     except Exception as e:
         logger.error(f"Page boxes extraction error: {e}")
@@ -71,4 +76,3 @@ async def get_page_boxes(request: PageBoxesRequest):
     finally:
         if input_path:
             await file_manager.cleanup(input_path)
-
