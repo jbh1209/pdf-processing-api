@@ -267,13 +267,12 @@ async def _callback_update_run(callback: CallbackConfig, frame_count: int, total
         
         if success:
             body = {
-                "imposed_pdf_url": callback.production_public_url,
-                "imposed_pdf_with_dielines_url": callback.proof_public_url,
-                "frames_count": frame_count,
-                "meters_to_print": total_meters,
-                "status": "approved",
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            }
+    "imposed_pdf_url": callback.production_public_url,
+    "imposed_pdf_with_dielines_url": callback.proof_public_url,
+    "status": "approved",
+    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+}
+
         else:
             body = {
                 "status": "planned",
