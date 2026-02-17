@@ -1,12 +1,13 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 import uuid
 import base64
 import io
 import math
 import time
+import gc
 import httpx
 
 from pypdf import PdfReader, PdfWriter, Transformation, PageObject
@@ -74,18 +75,30 @@ class LabelSlot(BaseModel):
     rotation: Optional[int] = 0
 
 
+class UploadConfig(BaseModel):
+    """Signed upload URLs from Supabase storage — VPS uploads directly."""
+    production_upload_url: str
+    production_public_url: str
+    proof_upload_url: Optional[str] = None
+    proof_public_url: Optional[str] = None
+
+
 class LabelImposeRequest(BaseModel):
     dieline: LabelDieline
     slots: List[LabelSlot]
     meters: float = 1.0
     include_dielines: bool = False
-    return_base64: bool = True
+    upload_config: Optional[UploadConfig] = None
+    # Legacy — kept for backward compat but ignored when upload_config is set
+    return_base64: bool = False
 
 
 class LabelImposeResponse(BaseModel):
     success: bool
-    production_pdf_base64: str
+    # Legacy base64 fields (only populated when upload_config is NOT provided)
+    production_pdf_base64: Optional[str] = None
     proof_pdf_base64: Optional[str] = None
+    # Always returned
     frame_count: int
     total_meters: float
 
@@ -197,7 +210,7 @@ async def download_imposition(file_id: str):
 
 
 # =============================================================================
-# LABEL IMPOSITION ENDPOINT (called by Supabase label-impose edge function)
+# HELPERS
 # =============================================================================
 
 async def _download_pdf(url: str) -> bytes:
@@ -208,11 +221,30 @@ async def _download_pdf(url: str) -> bytes:
         return resp.content
 
 
+async def _upload_to_signed_url(signed_url: str, pdf_bytes: bytes) -> None:
+    """Upload PDF bytes to a Supabase signed upload URL via PUT."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.put(
+            signed_url,
+            content=pdf_bytes,
+            headers={"Content-Type": "application/pdf"},
+        )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Storage upload failed ({resp.status_code}): {resp.text[:200]}",
+            )
+
+
 def _get_source_page(pdf_bytes: bytes) -> PageObject:
     """Read first page from PDF bytes."""
     reader = PdfReader(io.BytesIO(pdf_bytes))
     return reader.pages[0]
 
+
+# =============================================================================
+# LABEL IMPOSITION ENDPOINT (called by Supabase label-impose edge function)
+# =============================================================================
 
 @router.post("/labels", response_model=LabelImposeResponse)
 async def impose_labels(request: LabelImposeRequest):
@@ -220,7 +252,14 @@ async def impose_labels(request: LabelImposeRequest):
     Create imposed label PDF for HP Indigo roll printing.
 
     Accepts JSON with dieline config, slot assignments (each with a pdf_url),
-    and meters to print. Returns base64-encoded production and optional proof PDFs.
+    and meters to print.
+
+    When `upload_config` is provided (preferred):
+      - Uploads production & proof PDFs directly to Supabase storage via signed URLs
+      - Returns only metadata (frame_count, total_meters) — no base64
+
+    Legacy mode (no upload_config):
+      - Returns base64-encoded PDFs in the response body
     """
     start = time.time()
     d = request.dieline
@@ -243,9 +282,6 @@ async def impose_labels(request: LabelImposeRequest):
     frame_count = max(1, math.ceil((request.meters * 1000) / frame_h_mm))
     total_meters = round((frame_count * frame_h_mm) / 1000, 3)
 
-    # Total slots per frame
-    slots_per_frame = d.columns_across * d.rows_around
-
     # Download all unique PDFs
     unique_urls = {s.pdf_url for s in request.slots if s.pdf_url}
     pdf_cache: dict[str, bytes] = {}
@@ -264,7 +300,6 @@ async def impose_labels(request: LabelImposeRequest):
     prod_writer = PdfWriter()
 
     for frame_idx in range(frame_count):
-        # Create blank page for this frame
         frame_page = PageObject.create_blank_page(width=roll_w_pt, height=frame_h_pt)
 
         for row in range(d.rows_around):
@@ -277,20 +312,15 @@ async def impose_labels(request: LabelImposeRequest):
 
                 source_page = _get_source_page(pdf_cache[slot_info.pdf_url])
 
-                # Get source dimensions
                 src_w = float(source_page.mediabox.width)
                 src_h = float(source_page.mediabox.height)
 
-                # Determine rotation
                 rotation = slot_info.rotation or (90 if slot_info.needs_rotation else 0)
 
-                # Calculate position (bottom-left origin, rows go bottom to top)
                 x = col * (label_w_pt + h_gap_pt)
                 y = frame_h_pt - (row + 1) * label_h_pt - row * v_gap_pt
 
-                # Build transformation
                 if rotation == 90:
-                    # After 90° rotation, width/height swap
                     scale_x = label_w_pt / src_h if src_h else 1
                     scale_y = label_h_pt / src_w if src_w else 1
                     op = Transformation().scale(scale_x, scale_y).rotate(90).translate(x + label_w_pt, y)
@@ -315,10 +345,14 @@ async def impose_labels(request: LabelImposeRequest):
     prod_buf = io.BytesIO()
     prod_writer.write(prod_buf)
     prod_bytes = prod_buf.getvalue()
-    prod_b64 = base64.b64encode(prod_bytes).decode("ascii")
+    prod_buf.close()
+
+    # Free the writer immediately
+    del prod_writer
+    gc.collect()
 
     # Build proof PDF with dieline overlays if requested
-    proof_b64 = None
+    proof_bytes = None
     if request.include_dielines:
         try:
             from reportlab.lib.units import mm as rl_mm
@@ -326,11 +360,9 @@ async def impose_labels(request: LabelImposeRequest):
             from reportlab.pdfgen import canvas as rl_canvas
 
             proof_writer = PdfWriter()
-            # Re-read production pages and overlay dielines
             prod_reader = PdfReader(io.BytesIO(prod_bytes))
 
             for page in prod_reader.pages:
-                # Create dieline overlay
                 overlay_buf = io.BytesIO()
                 c = rl_canvas.Canvas(overlay_buf, pagesize=(roll_w_pt, frame_h_pt))
                 c.setStrokeColor(red)
@@ -358,14 +390,64 @@ async def impose_labels(request: LabelImposeRequest):
 
             proof_buf = io.BytesIO()
             proof_writer.write(proof_buf)
-            proof_b64 = base64.b64encode(proof_buf.getvalue()).decode("ascii")
+            proof_bytes = proof_buf.getvalue()
+            proof_buf.close()
+            del proof_writer, prod_reader
+            gc.collect()
+
         except ImportError:
             print("reportlab not installed — skipping proof overlay")
         except Exception as e:
             print(f"Proof overlay error: {e}")
 
+    # Clear the artwork cache — no longer needed
+    del pdf_cache
+    gc.collect()
+
     elapsed = round((time.time() - start) * 1000)
     print(f"Label imposition: {frame_count} frames, {total_meters}m, {elapsed}ms")
+
+    # -------------------------------------------------------------------------
+    # UPLOAD MODE (preferred): Upload directly to Supabase storage
+    # -------------------------------------------------------------------------
+    if request.upload_config:
+        uc = request.upload_config
+
+        # Upload production PDF
+        print(f"Uploading production PDF ({len(prod_bytes)} bytes) to storage...")
+        await _upload_to_signed_url(uc.production_upload_url, prod_bytes)
+        del prod_bytes
+        gc.collect()
+
+        # Upload proof PDF if we have one and a URL was provided
+        if proof_bytes and uc.proof_upload_url:
+            print(f"Uploading proof PDF ({len(proof_bytes)} bytes) to storage...")
+            await _upload_to_signed_url(uc.proof_upload_url, proof_bytes)
+            del proof_bytes
+            gc.collect()
+
+        print(f"Upload complete in {round((time.time() - start) * 1000)}ms total")
+
+        return LabelImposeResponse(
+            success=True,
+            production_pdf_base64=None,
+            proof_pdf_base64=None,
+            frame_count=frame_count,
+            total_meters=total_meters,
+        )
+
+    # -------------------------------------------------------------------------
+    # LEGACY MODE: Return base64 in response (kept for backward compatibility)
+    # -------------------------------------------------------------------------
+    prod_b64 = base64.b64encode(prod_bytes).decode("ascii")
+    del prod_bytes
+    gc.collect()
+
+    proof_b64 = None
+    if proof_bytes:
+        proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
+        del proof_bytes
+        gc.collect()
 
     return LabelImposeResponse(
         success=True,
