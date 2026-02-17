@@ -20,7 +20,19 @@ class Settings(BaseSettings):
     
     # Default ICC profile for CMYK conversion
     default_cmyk_profile: str = "ISOcoated_v2_eci.icc"
-    
+
+    # Admin/ops
+    admin_key: Optional[str] = None  # Protects /admin endpoints (query ?key= or X-Admin-Key header)
+
+    # Capacity / overload protection (especially for CPU+RAM heavy endpoints like /imposition/labels)
+    max_concurrent_jobs: int = 1
+    max_job_queue: int = 10
+    job_acquire_timeout_seconds: int = 0  # 0 = don't wait; return 503 when busy (set >0 to wait briefly)
+    job_timeout_seconds: int = 300  # Soft timeout for heavy processing sections
+
+    # Memory watchdog (optional). If >0, process exits when RSS exceeds this value (MB) so platform can restart it.
+    max_rss_mb: int = 0
+
     # Logging
     log_level: str = "INFO"
     

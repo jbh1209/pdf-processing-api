@@ -7,6 +7,8 @@ import time
 from app.config import settings
 from app.api.routes import api_router
 from app.utils.exceptions import PDFProcessingError
+from app.utils.capacity import CapacityManager
+from app.utils.runtime import get_rss_mb
 
 # Configure logging
 logging.basicConfig(
@@ -37,7 +39,7 @@ app.add_middleware(
 async def verify_api_key(request: Request, call_next):
     if settings.api_key:
         # Skip auth for health checks and docs
-        if request.url.path in ["/health", "/docs", "/redoc", "/openapi.json"]:
+        if request.url.path in ["/health", "/health/detailed", "/docs", "/redoc", "/openapi.json", "/admin", "/admin/status"]:
             return await call_next(request)
         
         api_key = request.headers.get("X-API-Key")
@@ -75,6 +77,30 @@ async def startup_event():
     # Ensure temp directory exists
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Temp directory: {settings.temp_dir}")
+
+    # Capacity manager (backpressure for heavy endpoints)
+    app.state.capacity_manager = CapacityManager(
+        max_concurrent=settings.max_concurrent_jobs,
+        max_queue=settings.max_job_queue,
+    )
+    logger.info(
+        f"Capacity: max_concurrent_jobs={settings.max_concurrent_jobs}, "
+        f"max_job_queue={settings.max_job_queue}, "
+        f"acquire_timeout_s={settings.job_acquire_timeout_seconds}"
+    )
+
+    # Optional memory watchdog (exits process when RSS exceeds threshold so the platform restarts it)
+    if settings.max_rss_mb and settings.max_rss_mb > 0:
+        import asyncio, os
+        async def _watchdog():
+            while True:
+                rss = get_rss_mb()
+                if rss and rss > float(settings.max_rss_mb):
+                    logger.error(f"Memory watchdog triggered: RSS={rss:.0f}MB > {settings.max_rss_mb}MB. Exiting for restart.")
+                    os._exit(1)
+                await asyncio.sleep(5)
+        app.state._watchdog_task = asyncio.create_task(_watchdog())
+        logger.info(f"Memory watchdog enabled: max_rss_mb={settings.max_rss_mb}")
 
 @app.on_event("shutdown")
 async def shutdown_event():

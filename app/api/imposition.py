@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
@@ -12,10 +12,24 @@ import httpx
 
 from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 
+from app.config import settings
 from app.services.pdfcpu import PdfcpuService
 from app.services.file_manager import FileManager
 
 router = APIRouter()
+
+async def _acquire_capacity(request: Request) -> None:
+    mgr = request.app.state.capacity_manager
+    ok = await mgr.acquire(timeout_seconds=settings.job_acquire_timeout_seconds)
+    if not ok:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy processing other jobs. Please retry shortly."
+        )
+
+async def _release_capacity(request: Request) -> None:
+    mgr = request.app.state.capacity_manager
+    await mgr.release()
 
 
 # =============================================================================
@@ -296,7 +310,7 @@ def _get_source_page(pdf_bytes: bytes) -> PageObject:
 # =============================================================================
 
 @router.post("/labels", response_model=LabelImposeResponse)
-async def impose_labels(request: LabelImposeRequest):
+async def impose_labels(payload: LabelImposeRequest, request: Request):
     """
     Create imposed label PDF for HP Indigo roll printing.
 
@@ -314,218 +328,222 @@ async def impose_labels(request: LabelImposeRequest):
     Legacy mode (no upload_config):
       - Returns base64-encoded PDFs in the response body
     """
-    start = time.time()
-    d = request.dieline
+    await _acquire_capacity(request)
+    try:
+        start = time.time()
+        d = payload.dieline
 
-    # Convert dieline dimensions to PDF points
-    label_w_pt = d.label_width_mm * MM_TO_PT
-    label_h_pt = d.label_height_mm * MM_TO_PT
-    h_gap_pt = d.horizontal_gap_mm * MM_TO_PT
-    v_gap_pt = d.vertical_gap_mm * MM_TO_PT
-    roll_w_pt = d.roll_width_mm * MM_TO_PT
+        # Convert dieline dimensions to PDF points
+        label_w_pt = d.label_width_mm * MM_TO_PT
+        label_h_pt = d.label_height_mm * MM_TO_PT
+        h_gap_pt = d.horizontal_gap_mm * MM_TO_PT
+        v_gap_pt = d.vertical_gap_mm * MM_TO_PT
+        roll_w_pt = d.roll_width_mm * MM_TO_PT
 
-    # Frame height = one repeat of all rows
-    frame_h_pt = (d.rows_around * label_h_pt) + ((d.rows_around - 1) * v_gap_pt)
-    frame_h_mm = frame_h_pt / MM_TO_PT
+        # Frame height = one repeat of all rows
+        frame_h_pt = (d.rows_around * label_h_pt) + ((d.rows_around - 1) * v_gap_pt)
+        frame_h_mm = frame_h_pt / MM_TO_PT
 
-    # How many frames needed to reach requested meters
-    if frame_h_mm <= 0:
-        raise HTTPException(status_code=400, detail="Invalid dieline dimensions")
+        # How many frames needed to reach requested meters
+        if frame_h_mm <= 0:
+            raise HTTPException(status_code=400, detail="Invalid dieline dimensions")
 
-    frame_count = max(1, math.ceil((request.meters * 1000) / frame_h_mm))
-    total_meters = round((frame_count * frame_h_mm) / 1000, 3)
+        frame_count = max(1, math.ceil((payload.meters * 1000) / frame_h_mm))
+        total_meters = round((frame_count * frame_h_mm) / 1000, 3)
 
-    # Download all unique PDFs
-    unique_urls = {s.pdf_url for s in request.slots if s.pdf_url}
-    pdf_cache: dict[str, bytes] = {}
+        # Download all unique PDFs
+        unique_urls = {s.pdf_url for s in payload.slots if s.pdf_url}
+        pdf_cache: dict[str, bytes] = {}
 
-    for url in unique_urls:
-        try:
-            pdf_cache[url] = await _download_pdf(url)
-        except Exception as e:
-            print(f"Failed to download PDF: {url} — {e}")
-            # If callback_config present, notify failure
-            if request.callback_config:
-                await _callback_update_run(request.callback_config, 0, 0, success=False)
-            raise HTTPException(status_code=422, detail=f"Failed to download artwork: {e}")
+        for url in unique_urls:
+            try:
+                pdf_cache[url] = await _download_pdf(url)
+            except Exception as e:
+                print(f"Failed to download PDF: {url} — {e}")
+                # If callback_config present, notify failure
+                if payload.callback_config:
+                    await _callback_update_run(payload.callback_config, 0, 0, success=False)
+                raise HTTPException(status_code=422, detail=f"Failed to download artwork: {e}")
 
-    # Build slot-to-page mapping (slot numbers are 1-based, row-major)
-    slot_map: dict[int, LabelSlot] = {s.slot: s for s in request.slots}
+        # Build slot-to-page mapping (slot numbers are 1-based, row-major)
+        slot_map: dict[int, LabelSlot] = {s.slot: s for s in payload.slots}
 
-    # Create production PDF
-    prod_writer = PdfWriter()
+        # Create production PDF
+        prod_writer = PdfWriter()
 
-    for frame_idx in range(frame_count):
-        frame_page = PageObject.create_blank_page(width=roll_w_pt, height=frame_h_pt)
+        for frame_idx in range(frame_count):
+            frame_page = PageObject.create_blank_page(width=roll_w_pt, height=frame_h_pt)
 
-        for row in range(d.rows_around):
-            for col in range(d.columns_across):
-                slot_num = row * d.columns_across + col + 1
-                slot_info = slot_map.get(slot_num)
+            for row in range(d.rows_around):
+                for col in range(d.columns_across):
+                    slot_num = row * d.columns_across + col + 1
+                    slot_info = slot_map.get(slot_num)
 
-                if not slot_info or not slot_info.pdf_url or slot_info.pdf_url not in pdf_cache:
-                    continue
+                    if not slot_info or not slot_info.pdf_url or slot_info.pdf_url not in pdf_cache:
+                        continue
 
-                source_page = _get_source_page(pdf_cache[slot_info.pdf_url])
+                    source_page = _get_source_page(pdf_cache[slot_info.pdf_url])
 
-                src_w = float(source_page.mediabox.width)
-                src_h = float(source_page.mediabox.height)
+                    src_w = float(source_page.mediabox.width)
+                    src_h = float(source_page.mediabox.height)
 
-                rotation = slot_info.rotation or (90 if slot_info.needs_rotation else 0)
+                    rotation = slot_info.rotation or (90 if slot_info.needs_rotation else 0)
 
-                x = col * (label_w_pt + h_gap_pt)
-                y = frame_h_pt - (row + 1) * label_h_pt - row * v_gap_pt
+                    x = col * (label_w_pt + h_gap_pt)
+                    y = frame_h_pt - (row + 1) * label_h_pt - row * v_gap_pt
 
-                if rotation == 90:
-                    scale_x = label_w_pt / src_h if src_h else 1
-                    scale_y = label_h_pt / src_w if src_w else 1
-                    op = Transformation().scale(scale_x, scale_y).rotate(90).translate(x + label_w_pt, y)
-                elif rotation == 180:
-                    scale_x = label_w_pt / src_w if src_w else 1
-                    scale_y = label_h_pt / src_h if src_h else 1
-                    op = Transformation().scale(scale_x, scale_y).rotate(180).translate(x + label_w_pt, y + label_h_pt)
-                elif rotation == 270:
-                    scale_x = label_w_pt / src_h if src_h else 1
-                    scale_y = label_h_pt / src_w if src_w else 1
-                    op = Transformation().scale(scale_x, scale_y).rotate(270).translate(x, y + label_h_pt)
-                else:
-                    scale_x = label_w_pt / src_w if src_w else 1
-                    scale_y = label_h_pt / src_h if src_h else 1
-                    op = Transformation().scale(scale_x, scale_y).translate(x, y)
+                    if rotation == 90:
+                        scale_x = label_w_pt / src_h if src_h else 1
+                        scale_y = label_h_pt / src_w if src_w else 1
+                        op = Transformation().scale(scale_x, scale_y).rotate(90).translate(x + label_w_pt, y)
+                    elif rotation == 180:
+                        scale_x = label_w_pt / src_w if src_w else 1
+                        scale_y = label_h_pt / src_h if src_h else 1
+                        op = Transformation().scale(scale_x, scale_y).rotate(180).translate(x + label_w_pt, y + label_h_pt)
+                    elif rotation == 270:
+                        scale_x = label_w_pt / src_h if src_h else 1
+                        scale_y = label_h_pt / src_w if src_w else 1
+                        op = Transformation().scale(scale_x, scale_y).rotate(270).translate(x, y + label_h_pt)
+                    else:
+                        scale_x = label_w_pt / src_w if src_w else 1
+                        scale_y = label_h_pt / src_h if src_h else 1
+                        op = Transformation().scale(scale_x, scale_y).translate(x, y)
 
-                frame_page.merge_transformed_page(source_page, op)
+                    frame_page.merge_transformed_page(source_page, op)
 
-        prod_writer.add_page(frame_page)
+            prod_writer.add_page(frame_page)
 
-    # Write production PDF to bytes
-    prod_buf = io.BytesIO()
-    prod_writer.write(prod_buf)
-    prod_bytes = prod_buf.getvalue()
-    prod_buf.close()
+        # Write production PDF to bytes
+        prod_buf = io.BytesIO()
+        prod_writer.write(prod_buf)
+        prod_bytes = prod_buf.getvalue()
+        prod_buf.close()
 
-    # Free the writer immediately
-    del prod_writer
-    gc.collect()
+        # Free the writer immediately
+        del prod_writer
+        gc.collect()
 
-    # Build proof PDF with dieline overlays if requested
-    proof_bytes = None
-    if request.include_dielines:
-        try:
-            from reportlab.lib.units import mm as rl_mm
-            from reportlab.lib.colors import red
-            from reportlab.pdfgen import canvas as rl_canvas
+        # Build proof PDF with dieline overlays if requested
+        proof_bytes = None
+        if payload.include_dielines:
+            try:
+                from reportlab.lib.units import mm as rl_mm
+                from reportlab.lib.colors import red
+                from reportlab.pdfgen import canvas as rl_canvas
 
-            proof_writer = PdfWriter()
-            prod_reader = PdfReader(io.BytesIO(prod_bytes))
+                proof_writer = PdfWriter()
+                prod_reader = PdfReader(io.BytesIO(prod_bytes))
 
-            for page in prod_reader.pages:
-                overlay_buf = io.BytesIO()
-                c = rl_canvas.Canvas(overlay_buf, pagesize=(roll_w_pt, frame_h_pt))
-                c.setStrokeColor(red)
-                c.setLineWidth(0.5)
+                for page in prod_reader.pages:
+                    overlay_buf = io.BytesIO()
+                    c = rl_canvas.Canvas(overlay_buf, pagesize=(roll_w_pt, frame_h_pt))
+                    c.setStrokeColor(red)
+                    c.setLineWidth(0.5)
 
-                for row in range(d.rows_around):
-                    for col in range(d.columns_across):
-                        x = col * (label_w_pt + h_gap_pt)
-                        y = frame_h_pt - (row + 1) * label_h_pt - row * v_gap_pt
+                    for row in range(d.rows_around):
+                        for col in range(d.columns_across):
+                            x = col * (label_w_pt + h_gap_pt)
+                            y = frame_h_pt - (row + 1) * label_h_pt - row * v_gap_pt
 
-                        if d.corner_radius_mm and d.corner_radius_mm > 0:
-                            r_pt = d.corner_radius_mm * MM_TO_PT
-                            c.roundRect(x, y, label_w_pt, label_h_pt, r_pt, stroke=1, fill=0)
-                        else:
-                            c.rect(x, y, label_w_pt, label_h_pt, stroke=1, fill=0)
+                            if d.corner_radius_mm and d.corner_radius_mm > 0:
+                                r_pt = d.corner_radius_mm * MM_TO_PT
+                                c.roundRect(x, y, label_w_pt, label_h_pt, r_pt, stroke=1, fill=0)
+                            else:
+                                c.rect(x, y, label_w_pt, label_h_pt, stroke=1, fill=0)
 
-                c.save()
-                overlay_buf.seek(0)
+                    c.save()
+                    overlay_buf.seek(0)
 
-                overlay_reader = PdfReader(overlay_buf)
-                overlay_page = overlay_reader.pages[0]
+                    overlay_reader = PdfReader(overlay_buf)
+                    overlay_page = overlay_reader.pages[0]
 
-                page.merge_page(overlay_page)
-                proof_writer.add_page(page)
+                    page.merge_page(overlay_page)
+                    proof_writer.add_page(page)
 
-            proof_buf = io.BytesIO()
-            proof_writer.write(proof_buf)
-            proof_bytes = proof_buf.getvalue()
-            proof_buf.close()
-            del proof_writer, prod_reader
-            gc.collect()
-
-        except ImportError:
-            print("reportlab not installed — skipping proof overlay")
-        except Exception as e:
-            print(f"Proof overlay error: {e}")
-
-    # Clear the artwork cache — no longer needed
-    del pdf_cache
-    gc.collect()
-
-    elapsed = round((time.time() - start) * 1000)
-    print(f"Label imposition: {frame_count} frames, {total_meters}m, {elapsed}ms")
-
-    # -------------------------------------------------------------------------
-    # UPLOAD MODE (preferred): Upload directly to Supabase storage
-    # -------------------------------------------------------------------------
-    if request.upload_config:
-        uc = request.upload_config
-
-        try:
-            # Upload production PDF
-            print(f"Uploading production PDF ({len(prod_bytes)} bytes) to storage...")
-            await _upload_to_signed_url(uc.production_upload_url, prod_bytes)
-            del prod_bytes
-            gc.collect()
-
-            # Upload proof PDF if we have one and a URL was provided
-            if proof_bytes and uc.proof_upload_url:
-                print(f"Uploading proof PDF ({len(proof_bytes)} bytes) to storage...")
-                await _upload_to_signed_url(uc.proof_upload_url, proof_bytes)
-                del proof_bytes
+                proof_buf = io.BytesIO()
+                proof_writer.write(proof_buf)
+                proof_bytes = proof_buf.getvalue()
+                proof_buf.close()
+                del proof_writer, prod_reader
                 gc.collect()
 
-            print(f"Upload complete in {round((time.time() - start) * 1000)}ms total")
+            except ImportError:
+                print("reportlab not installed — skipping proof overlay")
+            except Exception as e:
+                print(f"Proof overlay error: {e}")
 
-            # Callback: update label_runs via Supabase REST API
-            if request.callback_config:
-                await _callback_update_run(
-                    request.callback_config,
-                    frame_count,
-                    total_meters,
-                    success=True,
-                )
+        # Clear the artwork cache — no longer needed
+        del pdf_cache
+        gc.collect()
 
-        except Exception as e:
-            print(f"Upload/callback error: {e}")
-            # Notify failure via callback
-            if request.callback_config:
-                await _callback_update_run(request.callback_config, 0, 0, success=False)
-            raise
+        elapsed = round((time.time() - start) * 1000)
+        print(f"Label imposition: {frame_count} frames, {total_meters}m, {elapsed}ms")
+
+        # -------------------------------------------------------------------------
+        # UPLOAD MODE (preferred): Upload directly to Supabase storage
+        # -------------------------------------------------------------------------
+        if payload.upload_config:
+            uc = payload.upload_config
+
+            try:
+                # Upload production PDF
+                print(f"Uploading production PDF ({len(prod_bytes)} bytes) to storage...")
+                await _upload_to_signed_url(uc.production_upload_url, prod_bytes)
+                del prod_bytes
+                gc.collect()
+
+                # Upload proof PDF if we have one and a URL was provided
+                if proof_bytes and uc.proof_upload_url:
+                    print(f"Uploading proof PDF ({len(proof_bytes)} bytes) to storage...")
+                    await _upload_to_signed_url(uc.proof_upload_url, proof_bytes)
+                    del proof_bytes
+                    gc.collect()
+
+                print(f"Upload complete in {round((time.time() - start) * 1000)}ms total")
+
+                # Callback: update label_runs via Supabase REST API
+                if payload.callback_config:
+                    await _callback_update_run(
+                        payload.callback_config,
+                        frame_count,
+                        total_meters,
+                        success=True,
+                    )
+
+            except Exception as e:
+                print(f"Upload/callback error: {e}")
+                # Notify failure via callback
+                if payload.callback_config:
+                    await _callback_update_run(payload.callback_config, 0, 0, success=False)
+                raise
+
+            return LabelImposeResponse(
+                success=True,
+                production_pdf_base64=None,
+                proof_pdf_base64=None,
+                frame_count=frame_count,
+                total_meters=total_meters,
+            )
+
+        # -------------------------------------------------------------------------
+        # LEGACY MODE: Return base64 in response (kept for backward compatibility)
+        # -------------------------------------------------------------------------
+        prod_b64 = base64.b64encode(prod_bytes).decode("ascii")
+        del prod_bytes
+        gc.collect()
+
+        proof_b64 = None
+        if proof_bytes:
+            proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
+            del proof_bytes
+            gc.collect()
 
         return LabelImposeResponse(
             success=True,
-            production_pdf_base64=None,
-            proof_pdf_base64=None,
+            production_pdf_base64=prod_b64,
+            proof_pdf_base64=proof_b64,
             frame_count=frame_count,
             total_meters=total_meters,
         )
-
-    # -------------------------------------------------------------------------
-    # LEGACY MODE: Return base64 in response (kept for backward compatibility)
-    # -------------------------------------------------------------------------
-    prod_b64 = base64.b64encode(prod_bytes).decode("ascii")
-    del prod_bytes
-    gc.collect()
-
-    proof_b64 = None
-    if proof_bytes:
-        proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
-        del proof_bytes
-        gc.collect()
-
-    return LabelImposeResponse(
-        success=True,
-        production_pdf_base64=prod_b64,
-        proof_pdf_base64=proof_b64,
-        frame_count=frame_count,
-        total_meters=total_meters,
-    )
+    finally:
+        await _release_capacity(request)
