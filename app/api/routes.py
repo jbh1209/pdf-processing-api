@@ -12,7 +12,6 @@ from app.api.manipulate import router as manipulate_router
 from app.api.page_boxes import router as page_boxes_router
 
 from app.config import settings
-from app.services.capacity import CapacityManager
 from app.services.ghostscript import GhostscriptService
 from app.utils.files import download_file
 
@@ -32,10 +31,10 @@ async def rasterize_pdf(request: Request):
     """Rasterize PDF pages to PNG/JPEG images."""
     body = await request.json()
     pdf_url = body.get("pdf_url")
-    pages = body.get("pages")          # optional list of ints
-    dpi = body.get("dpi", 150)         # default 150
-    fmt = body.get("format", "png")    # png or jpeg
-    max_width = body.get("max_width")  # optional pixel cap
+    pages = body.get("pages")
+    dpi = body.get("dpi", 150)
+    fmt = body.get("format", "png")
+    max_width = body.get("max_width")
 
     if not pdf_url:
         raise HTTPException(status_code=400, detail="pdf_url is required")
@@ -44,25 +43,20 @@ async def rasterize_pdf(request: Request):
     if dpi < 36 or dpi > 600:
         raise HTTPException(status_code=400, detail="dpi must be between 36 and 600")
 
-    capacity: CapacityManager = request.app.state.capacity_manager
+    with tempfile.TemporaryDirectory(dir=settings.temp_dir) as tmp:
+        tmp_path = Path(tmp)
+        input_pdf = tmp_path / "input.pdf"
 
-    async with capacity.acquire(timeout=settings.job_acquire_timeout_seconds):
-        with tempfile.TemporaryDirectory(dir=settings.temp_dir) as tmp:
-            tmp_path = Path(tmp)
-            input_pdf = tmp_path / "input.pdf"
+        await download_file(pdf_url, input_pdf)
 
-            # Download the PDF
-            await download_file(pdf_url, input_pdf)
-
-            # Rasterize
-            gs = GhostscriptService()
-            results = await gs.rasterize_pages(
-                input_path=input_pdf,
-                output_dir=tmp_path,
-                pages=pages,
-                dpi=dpi,
-                fmt=fmt,
-                max_width=max_width,
-            )
+        gs = GhostscriptService()
+        results = await gs.rasterize_pages(
+            input_path=input_pdf,
+            output_dir=tmp_path,
+            pages=pages,
+            dpi=dpi,
+            fmt=fmt,
+            max_width=max_width,
+        )
 
     return {"pages": results}
